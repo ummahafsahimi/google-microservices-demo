@@ -1,0 +1,166 @@
+name: Build, Push & Update GitOps
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - ".github/workflows/ci.yaml"
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to build (e.g. frontend, cartservice) or "all" for all services'
+        required: true
+        default: 'all'
+
+jobs:
+  build-push-update-gitops:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      # -------------------------------
+      # Checkout with history for diff
+      # -------------------------------
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # -------------------------------
+      # Detect all changed microservices
+      # -------------------------------
+      - name: Detect changed microservices
+        id: detect
+        run: |
+          if [ -n "${{ github.event.inputs.service }}" ]; then
+            if [ "${{ github.event.inputs.service }}" == "all" ]; then
+              SERVICES="adservice cartservice checkoutservice currencyservice emailservice frontend paymentservice productcatalogservice recommendationservice shippingservice"
+              echo "Building all services"
+            else
+              SERVICES="${{ github.event.inputs.service }}"
+              echo "Manual trigger — service: $SERVICES"
+            fi
+          else
+            SERVICES=$(git diff --name-only HEAD~1 HEAD \
+              | grep '^src/' \
+              | cut -d'/' -f2 \
+              | sort -u \
+              | tr '\n' ' ' || true)
+          fi
+
+          if [ -z "$SERVICES" ]; then
+            echo "No services detected — skipping build"
+            echo "services=" >> $GITHUB_OUTPUT
+          else
+            echo "Detected services: $SERVICES"
+            echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          fi
+
+      # -------------------------------
+      # Authenticate to Google Cloud
+      # -------------------------------
+      - name: Authenticate to Google Cloud
+        if: steps.detect.outputs.services != ''
+        uses: google-github-actions/auth@v2
+        id: auth
+        with:
+          workload_identity_provider: "projects/${{ vars.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: "cicd-sa@ecommerce-platform-automation.iam.gserviceaccount.com"
+          token_format: access_token
+
+      # -------------------------------
+      # Configure Docker for Artifact Registry
+      # -------------------------------
+      - name: Configure Docker for Artifact Registry
+        if: steps.detect.outputs.services != ''
+        uses: docker/login-action@v3
+        with:
+          registry: northamerica-northeast2-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      # -------------------------------
+      # Build & Push all changed services
+      # -------------------------------
+      - name: Build and Push Docker images
+        if: steps.detect.outputs.services != ''
+        run: |
+          for SERVICE in ${{ steps.detect.outputs.services }}; do
+            IMAGE="northamerica-northeast2-docker.pkg.dev/ecommerce-platform-automation/inventory-registry/${SERVICE}:${{ github.sha }}"
+            echo "==============================="
+            echo "Building: $IMAGE"
+            echo "==============================="
+
+            # handle nested src/ structure
+            if [ -f "src/${SERVICE}/src/Dockerfile" ]; then
+              CONTEXT="src/${SERVICE}/src"
+            else
+              CONTEXT="src/${SERVICE}"
+            fi
+
+            echo "Using context: $CONTEXT"
+            docker build -t $IMAGE $CONTEXT
+
+            echo "Pushing: $IMAGE"
+            docker push $IMAGE
+          done
+
+# -------------------------------
+      # Clone GitOps repo
+      # -------------------------------
+      - name: Clone GitOps repo
+        if: steps.detect.outputs.services != ''
+        run: |
+          git clone https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/ummahafsahimi/A-Cloude-Native-SaaS-Platform-with-Full-DevOps-Automation.git gitops
+          cd gitops
+          git checkout gitOps
+
+      # -------------------------------
+      # Update appVersion for all changed services
+      # -------------------------------
+      - name: Update GitOps values files
+        if: steps.detect.outputs.services != ''
+        run: |
+          SHA=${{ github.sha }}
+          cd gitops
+
+          for SERVICE in ${{ steps.detect.outputs.services }}; do
+            case "$SERVICE" in
+              adservice)             VALUES_FILE="values/ad-service-values.yaml" ;;
+              cartservice)           VALUES_FILE="values/cart-service-values.yaml" ;;
+              checkoutservice)       VALUES_FILE="values/checkout-service-values.yaml" ;;
+              currencyservice)       VALUES_FILE="values/currency-service-values.yaml" ;;
+              emailservice)          VALUES_FILE="values/email-service-values.yaml" ;;
+              frontend)              VALUES_FILE="values/frontend-values.yaml" ;;
+              paymentservice)        VALUES_FILE="values/payment-service-values.yaml" ;;
+              productcatalogservice) VALUES_FILE="values/productcatalog-service-values.yaml" ;;
+              recommendationservice) VALUES_FILE="values/recommendation-service-values.yaml" ;;
+              shippingservice)       VALUES_FILE="values/shipping-service-values.yaml" ;;
+              *)
+                echo "Unknown service: $SERVICE — skipping"
+                continue
+                ;;
+            esac
+
+            echo "Updating $VALUES_FILE → appVersion: $SHA"
+            sed -i "s/^appVersion: .*/appVersion: \"${SHA}\"/" "$VALUES_FILE"
+          done
+
+      # -------------------------------
+      # Commit & push GitOps changes
+      # -------------------------------
+      - name: Commit and push GitOps changes
+        if: steps.detect.outputs.services != ''
+        run: |
+          cd gitops
+          git config user.email "ci-bot@github.com"
+          git config user.name "GitHub Actions CI"
+          git add values/*.yaml
+          git commit -m "ci: update [${{ steps.detect.outputs.services }}] to ${{ github.sha }}" \
+            || echo "No changes to commit"
+          git push origin gitOps \
+            || echo "Nothing to push"
