@@ -26,8 +26,8 @@ obj/
 pkg/
 release/wi-kubernetes-manifests.yaml
 vendor/
-terraform/
+#terraform/
 test.sh
-istio-manifests/
-kubernetes-manifests/
-helm-chart/
+#istio-manifests/
+#kubernetes-manifests/
+#helm-chart/
